@@ -14,7 +14,8 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: STM32H5 implementation in progress** (branch `Dev/STM32H5`, see the section STM32H5 implementation).
+> The interface below is the specification (identical for all families); the other families are planned.
 
 ---
 
@@ -77,7 +78,7 @@ master.
 
 | Family | Branch | Controller | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `FMC` on STM32H523, H533, H562, H563, H573 and the H5E / H5F lines: SRAM / PSRAM (4 banks) / NOR / FRAM, NAND with ECC (up to 8 KB), SDRAM / mobile LPSDR, 8080 / 6800 LCD, 8- and 16-bit bus, burst, the write FIFO of 16 words and the read FIFO of 6 words for the SDRAM; not on STM32H503 / H543 / H553 | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `FMC` on STM32H523, H533, H543, H553, H562, H563, H573 and the H5E / H5F lines: SRAM / PSRAM (4 banks) / NOR / FRAM, NAND with ECC (up to 8 KB), SDRAM / mobile LPSDR (not on STM32H523 / H533), 8080 / 6800 LCD, 8- and 16-bit bus (32-bit on the H5E / H5F lines), burst, the write FIFO of 16 words and the read FIFO of 6 words for the SDRAM; not on STM32H503 | implementation in progress (unit tests on 12 lines, integration tests compiled, not run on hardware) |
 | STM32U5 | `Dev/STM32U5` | `FMC` on the lines that have it | planned |
 | STM32H7 | `Dev/STM32H7` | `FMC` with the SDRAM banks | planned |
 | STM32F7 | `Dev/STM32F7` | `FMC` with the SDRAM banks | planned |
@@ -263,6 +264,122 @@ target_link_libraries( User_Lib PRIVATE Fmc_Lib )
 1. Link `Fmc_Lib` to your CMake library.
 2. Include `Fmc_Port.h` in your project.
 3. Configure the module as needed for your hardware.
+
+---
+
+## STM32H5 implementation
+
+Branch `Dev/STM32H5`, library `Fmc_Lib`. Status: the NOR / PSRAM / SRAM banks, the interrupt and the pins (`Fmc.c`), the SDRAM
+banks (`Fmc_Sdram.c`) and the NAND bank with the ECC (`Fmc_Nand.c`) are implemented. The unit tests (73 cases) pass on all 12 lines;
+the integration tests are only compiled and linked (STM32H503, STM32H563), nothing was run on hardware.
+
+### Device lines
+
+| Line | NOR / PSRAM / SRAM banks (4) | NAND bank | SDRAM banks (2) | Data bus |
+|---|---|---|---|---|
+| STM32H503 | - (every function returns `FMC_REQUEST_ERROR`) | - | - | - |
+| STM32H523, H533 | yes | yes | - | 8 / 16 bit |
+| STM32H543, H553, H562, H563, H573 | yes | yes | yes | 8 / 16 bit |
+| STM32H5E4, H5E5, H5F4, H5F5 | yes | yes | yes | 8 / 16 / 32 bit (`FMC_DATA_WIDTH_32`, not for the NAND) |
+
+The banks of `fmc_Bank_t` and the 32-bit width exist only on the lines that have them. The kernel clock of the controller is
+the bus clock `HCLK`, read from the Rcc module (`RCC_PERIPH_FMC`).
+
+### Files
+
+| File | Content |
+|---|---|
+| `Fmc_Types.h`, `Fmc_Port.h` | Public interface |
+| `Fmc_Pins.h` | Pin lists (address, data, control, SDRAM), generated from the STM32CubeMX database, guarded per device line |
+| `Fmc.h` | Private declarations: run-time state, conversions of the timing to register values (pure functions) |
+| `Fmc.c` | Module management, NOR / PSRAM / SRAM banks, bank activation, write protection, interrupt, pins |
+| `Fmc_Sdram.c` | SDRAM banks: configuration, initialization sequence, refresh rate, self-refresh, power-down, raw command, state |
+| `Fmc_Nand.c` | NAND bank: configuration, ECC, ready / busy signal and its events |
+| `Fmc_Reg.c`, `Fmc_Reg.h` | The only place that touches the registers: bounds checked accessors, the controller enable protocol |
+
+### Timing and the controller enable
+
+- Every time is converted to cycles of the bus clock by `ceil( time * HCLK / 10^9 )` (a time is never approximated to a shorter
+  one) and raised to the smallest value the controller can generate (`DATAST` and `ADDHLD` at least one cycle, `ADDSET` at least
+  one cycle for a multiplexed bus, a PSRAM and the access mode D). A time that needs more cycles than its register field holds is
+  rejected before any register is written, the same for the data latency (2 to 17 `FMC_CLK` cycles) and the `FMC_CLK` period
+  (1 to 16 bus clock cycles).
+- The register offsets of RM0481 are applied by the module: the bus turnaround is `BUSTURN + 1` cycles, the data hold of a write
+  is `DATAHLD + 1` cycles (the read data hold is the register value, so one `DATAHLD` serves both when the extended mode is not used).
+- The controller registers except the on-the-fly bits are changed with the controller disabled (RM0481 23.2): a configuration
+  function disables `FMCEN`, writes the registers, enables it again and verifies the registers by read-back. No bank may be accessed
+  while such a function runs (an access to a bank of the disabled controller is a bus error).
+- `Fmc_Init` disables all banks (bank 1 is enabled after the reset), sets the write FIFO and the continuous clock, enables the
+  controller and verifies `BCR1` by read-back; on a failure the module is deinitialized.
+
+### SDRAM
+
+- `Fmc_Set_SdramConfig` converts every time to cycles of the SDRAM clock (`HCLK` divided by `ClockDivider`, exact `ceil( time * HCLK /
+  ( divider * 10^9 ) )`), raises it to the smallest value of the controller (tMRD 3 cycles, the other timings 2 cycles) and rejects a time
+  above the register field (tMRD 18 cycles, the others 17). tWR is raised to satisfy `tWR >= tRAS - tRCD` and `tWR >= tRC - tRCD - tRP`
+  (RM0481 23.8.5); the call is rejected when that needs more than 17 cycles. The refresh period must be meetable by the clock too (the
+  refresh count has to be 41 .. 8191), otherwise nothing is written.
+- Two SDRAM banks: the clock divider, the read burst and the read pipe are common (they live in `FMC_SDCR1`), the second bank must carry the
+  same values. The timings the controller shares between the devices (tRP and tRC in `FMC_SDTR1`, tWR and tXSR in both registers, tMRD and
+  tRAS of bank 1 for the commands to both banks) are the slowest of both devices; the register of a bank that is not used keeps its reset value.
+  Both banks are configured before one of them is activated; any new configuration makes a new `Fmc_Set_SdramInit` necessary.
+- `Fmc_Set_SdramInit( bank )` runs the sequence of RM0481 23.8.3 for **every configured SDRAM bank at once** (the precharge all and the
+  auto-refresh must reach both devices simultaneously): clock enable, power-up delay, precharge all, 8 auto-refresh cycles, load of the mode
+  register of each bank (burst length 1, sequential, the CAS latency of the bank, standard operation, single location write), refresh count.
+  Every wait for the controller is a bounded loop on `FMC_SDSR.BUSY`. The power-up delay is a time requirement of the memory, not a flag of
+  the controller: it is a busy loop derived from the bus clock (never shorter than requested), at least 100 us (`PowerUpDelay_us` of the
+  configuration extends it).
+- Refresh: `COUNT = floor( RefreshPeriod_ms * SDRAM clock / RefreshRows / 1000 ) - 20` (rounded down, the safety margin of the reference
+  manual), decreased by one when it equals the sum of the timings plus four cycles (RM0481 note); `Fmc_Set_SdramRefreshRate` writes it
+  again. The refresh error interrupt is enabled when the event mode is `FMC_EVENT_MODE_ISR` and a refresh error or error callback exists, in
+  `FMC_EVENT_MODE_POLL` `Fmc_Task` reads and clears the flag.
+- `Fmc_Set_BankActive` of an SDRAM bank sends the normal mode command (also the exit of the self-refresh and the power-down) and needs the
+  initialization; `Fmc_Set_SdramSelfRefresh` and `Fmc_Set_SdramPowerDown` wait for the mode reported by the controller. `Fmc_Set_SdramCommand`
+  sends one raw command to one bank. `Fmc_Get_SdramState` has no side effect.
+- Limits: the extended mode register of a mobile LPSDR SDRAM (dummy read with BA1 = 1) is not programmed by the module. A precharge all
+  command to bank 1 is needed before an access to bank 2 (RM0481 23.8.4), the application issues `FMC_SDRAM_COMMAND_PRECHARGE_ALL` for it.
+  The module does not know the board: the write recovery and the other times include no board delay.
+
+### NAND
+
+- `Fmc_Set_NandConfig` converts the timing of the common and of the attribute memory space (setup, wait, hold and data bus high-Z time)
+  to bus clock cycles (setup 1 .. 255, wait 2 .. 255, hold 1 .. 254, high-Z 1 .. 255 cycles; the registers hold cycles - 1, cycles - 1,
+  cycles and cycles - 1) and the delays of ALE and CLE to the read strobe to the `TAR` / `TCLR` fields (`delay = ( field + setup field + 2 )`
+  cycles, the smaller setup field of both spaces, field 0 .. 15). Nothing is written when a time does not fit. The hold time is converted
+  for the write access (a read has two more cycles of hold), so it is met for both. The data width is 8 or 16 bits.
+- ECC: `Fmc_Set_NandEccActive` resets and enables the ECC logic (the NAND bank must be configured with `EccEnable`), `Fmc_Get_NandEcc`
+  waits (bounded) until the write FIFO of the controller is empty, reads `FMC_ECCR`, keeps the bits valid for the page size (22 bits for 256
+  bytes, two more for every doubling up to 32 bits for 8192 bytes) and stops the calculation, as the reference manual prescribes (the
+  code is read once per calculation). The comparison with the stored code and the correction belong to the NAND driver.
+- `Fmc_Get_NandReadyState` reads the ready / busy signal through the high level detection of the controller (it enables the detection
+  for the call, clears the flag and polls it a bounded number of times; the flag of the high level event is cleared by the call).
+  The events (rising edge, falling edge, high level) are reported by `NandReadyCallback` from `Fmc_Task` or the interrupt; the high level
+  event repeats while the signal stays high.
+- Not verified: the behaviour of the high level flag against a real NAND (the module relies on the flag being set by the hardware while the
+  signal is high) and the ECC bit widths of the reference manual table (the text of the table is damaged in the extracted manual and the
+  widths are taken from its pattern); both need a board.
+
+### Notes and deviations from the specification
+
+- The specification table lists no FMC on STM32H543 / H553. The CMSIS device headers, the STM32CubeMX database and RM0481 have the FMC
+  (with the SDRAM controller) on these lines, so they are implemented; the datasheets were not available to confirm it.
+- A time below the controller minimum is raised to the minimum, not rejected (a minimum time of a memory is still met); only a time
+  above the register field is rejected.
+- A configuration field is a list or a typed value: `ColumnBits`, `RowBits`, `InternalBanks`, `DataWidth` and `CasLatency` are lists whose
+  items carry the number (`FMC_SDRAM_COLUMN_BITS_9 = 9u`), so a plain number from the specification example is accepted when it is an item.
+- `fmc_NorSramConfig_t` adds `DataHold_ns`, `ByteLaneSetup_ns`, `ChipSelectMaxLow_ns` and `WriteTiming` (the separate write timing of the
+  extended mode); a zero-initialized structure selects the safe defaults (SRAM, writes enabled, asynchronous, no wait signal).
+- `fmc_Config_t` holds the pointers of the bank configurations to apply at the start; they are read by `Fmc_Init` only. The banks are
+  configured, not activated: `Fmc_Set_BankActive` enables a bank.
+- `Fmc_Set_BankInactive` rejects an SDRAM bank (the controller has no enable bit); the self-refresh and the power-down end with
+  `Fmc_Set_BankActive`.
+- The SDRAM clock divider list is `FMC_SDRAM_CLOCK_DIV_2` (default, value 0), `_3` and `_1` (the controller of STM32H5 also allows the
+  bus clock itself, the specification names `/ 2` and `/ 3`). `Fmc_Set_SdramRefreshRate` takes the refresh period and the number of
+  rows, `Fmc_Set_SdramCommand` takes a command structure (`fmc_SdramCommand_t`); the configuration adds `PowerUpDelay_us`.
+- `Fmc_Set_BankWriteProtection` takes the protection state as a second parameter and also protects a NOR / PSRAM / SRAM bank (`WREN`).
+- The pins: `fmc_AddressPin_t`, `fmc_DataPin_t`, `fmc_ControlPin_t`, `fmc_SdramPin_t` list every valid pad (128 items). The multiplexed
+  `FMC_DA0` .. `FMC_DA15` are the pads of `FMC_D0` .. `FMC_D15` and have no list of their own; `FMC_NBL0` .. `FMC_NBL3` (also the SDRAM
+  byte mask) are in the control list. `Fmc_Init` configures the pins of the lists of `fmc_Config_t`.
 
 ---
 
